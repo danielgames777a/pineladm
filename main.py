@@ -1,13 +1,25 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from datetime import datetime, timedelta
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import json
+import time
 import os
+import uuid
 
 app = FastAPI()
 
+# Libera CORS (pra não dar erro no bot)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 DB_FILE = "licenses_db.json"
-NOTICE_FILE = "notice.txt"
+ADMIN_USER = "admin"
+ADMIN_PASS = "123456"  # TROCA ESSA SENHA
 
 def load_db():
     if not os.path.exists(DB_FILE):
@@ -15,48 +27,106 @@ def load_db():
     with open(DB_FILE, "r") as f:
         return json.load(f)
 
-def save_db(db):
+def save_db(data):
     with open(DB_FILE, "w") as f:
-        json.dump(db, f, indent=2)
+        json.dump(data, f, indent=4)
 
-class ValidateReq(BaseModel):
-    key: str
-    hwid: str
+def now():
+    return int(time.time())
 
-@app.get("/")
-def home():
-    return {"status": "ok", "service": "pineladm"}
+# ------------------- API PRO BOT -------------------
 
-@app.get("/api/notice")
-def get_notice():
-    if os.path.exists(NOTICE_FILE):
-        with open(NOTICE_FILE, "r") as f:
-            return {"notice": f.read()}
-    return {"notice": ""}
+@app.post("/api/validate")
+async def validate_license(data: dict):
+    key = data.get("key")
+    hwid = data.get("hwid")
 
-@app.post("/api/validar")
-def validar(req: ValidateReq):
     db = load_db()
-    key = req.key
 
     if key not in db:
-        return {"ok": False, "msg": "Key inválida", "notice": ""}
+        return {"success": False, "message": "Key inválida", "notice": ""}
 
     lic = db[key]
 
-    # verifica expiração
-    if lic["expires_at"]:
-        exp = datetime.fromisoformat(lic["expires_at"])
-        if datetime.utcnow() > exp:
-            return {"ok": False, "msg": "Key expirada", "notice": ""}
+    if lic["expires_at"] < now():
+        return {"success": False, "message": "Key expirada", "notice": ""}
 
-    # verifica HWID (primeiro uso grava)
-    if lic.get("hwid") is None:
-        lic["hwid"] = req.hwid
+    if lic["hwid"] is None:
+        lic["hwid"] = hwid
         db[key] = lic
         save_db(db)
-    elif lic["hwid"] != req.hwid:
-        return {"ok": False, "msg": "HWID não autorizado", "notice": ""}
 
-    return {"ok": True, "msg": "Acesso liberado", "notice": ""}
+    elif lic["hwid"] != hwid:
+        return {"success": False, "message": "Key já está em uso em outro PC", "notice": ""}
 
+    return {"success": True, "message": "Licença válida. Bem-vindo!", "notice": ""}
+
+@app.get("/api/notice")
+async def get_notice():
+    return {"notice": ""}
+
+# ------------------- PAINEL WEB SIMPLES -------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def panel():
+    return """
+    <html>
+    <head>
+        <title>Painel ADM</title>
+    </head>
+    <body style="background:#111;color:white;font-family:Arial;padding:40px">
+        <h1>Painel Admin - JOTTEX AUTO</h1>
+        <form method="post" action="/create">
+            <p>Dias de validade:</p>
+            <input type="number" name="days" value="1"/>
+            <br><br>
+            <button type="submit">Gerar KEY</button>
+        </form>
+        <br>
+        <a href="/list">Ver KEYS</a>
+    </body>
+    </html>
+    """
+
+@app.post("/create", response_class=HTMLResponse)
+async def create_key(request: Request):
+    form = await request.form()
+    days = int(form.get("days", 1))
+
+    db = load_db()
+    key = str(uuid.uuid4()).split("-")[0].upper()
+    expires_at = now() + (days * 86400)
+
+    db[key] = {
+        "hwid": None,
+        "expires_at": expires_at
+    }
+
+    save_db(db)
+
+    return f"""
+    <html><body style="background:#111;color:white;font-family:Arial;padding:40px">
+    <h2>Key criada com sucesso:</h2>
+    <h1>{key}</h1>
+    <a href="/">Voltar</a>
+    </body></html>
+    """
+
+@app.get("/list", response_class=HTMLResponse)
+async def list_keys():
+    db = load_db()
+    rows = ""
+    for k, v in db.items():
+        rows += f"<tr><td>{k}</td><td>{v['hwid']}</td><td>{time.ctime(v['expires_at'])}</td></tr>"
+
+    return f"""
+    <html><body style="background:#111;color:white;font-family:Arial;padding:40px">
+    <h2>Licenças</h2>
+    <table border="1" cellpadding="10">
+        <tr><th>KEY</th><th>HWID</th><th>EXPIRA EM</th></tr>
+        {rows}
+    </table>
+    <br>
+    <a href="/">Voltar</a>
+    </body></html>
+    """
