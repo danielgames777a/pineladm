@@ -1,5 +1,5 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request, Form, Depends
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import time
@@ -8,7 +8,6 @@ import uuid
 
 app = FastAPI()
 
-# Libera CORS (pra não dar erro no bot)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,8 +17,12 @@ app.add_middleware(
 )
 
 DB_FILE = "licenses_db.json"
+NOTICE_FILE = "notice.txt"
+
 ADMIN_USER = "admin"
-ADMIN_PASS = "123456"  # TROCA ESSA SENHA
+ADMIN_PASS = "123456"  # MUDA ESSA SENHA
+
+sessions = {}
 
 def load_db():
     if not os.path.exists(DB_FILE):
@@ -31,25 +34,41 @@ def save_db(data):
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
+def load_notice():
+    if not os.path.exists(NOTICE_FILE):
+        return ""
+    return open(NOTICE_FILE).read()
+
+def save_notice(txt):
+    with open(NOTICE_FILE, "w") as f:
+        f.write(txt)
+
 def now():
     return int(time.time())
 
-# ------------------- API PRO BOT -------------------
+def auth(token: str = ""):
+    return token in sessions
+
+# ---------------- API PRO BOT ----------------
 
 @app.post("/api/validate")
-async def validate_license(data: dict):
+async def api_validate(data: dict):
     key = data.get("key")
     hwid = data.get("hwid")
 
     db = load_db()
+    notice = load_notice()
 
     if key not in db:
-        return {"success": False, "message": "Key inválida", "notice": ""}
+        return {"success": False, "message": "Key inválida", "notice": notice}
 
     lic = db[key]
 
+    if lic.get("banned"):
+        return {"success": False, "message": "Key banida", "notice": notice}
+
     if lic["expires_at"] < now():
-        return {"success": False, "message": "Key expirada", "notice": ""}
+        return {"success": False, "message": "Key expirada", "notice": notice}
 
     if lic["hwid"] is None:
         lic["hwid"] = hwid
@@ -57,76 +76,132 @@ async def validate_license(data: dict):
         save_db(db)
 
     elif lic["hwid"] != hwid:
-        return {"success": False, "message": "Key já está em uso em outro PC", "notice": ""}
+        return {"success": False, "message": "Key já em uso em outro PC", "notice": notice}
 
-    return {"success": True, "message": "Licença válida. Bem-vindo!", "notice": ""}
+    return {"success": True, "message": "Licença válida. Bem-vindo!", "notice": notice}
 
 @app.get("/api/notice")
-async def get_notice():
-    return {"notice": ""}
+async def api_notice():
+    return {"notice": load_notice()}
 
-# ------------------- PAINEL WEB SIMPLES -------------------
+# ---------------- PAINEL WEB ----------------
 
 @app.get("/", response_class=HTMLResponse)
-async def panel():
+async def login():
     return """
-    <html>
-    <head>
-        <title>Painel ADM</title>
-    </head>
-    <body style="background:#111;color:white;font-family:Arial;padding:40px">
-        <h1>Painel Admin - JOTTEX AUTO</h1>
-        <form method="post" action="/create">
-            <p>Dias de validade:</p>
-            <input type="number" name="days" value="1"/>
-            <br><br>
-            <button type="submit">Gerar KEY</button>
-        </form>
-        <br>
-        <a href="/list">Ver KEYS</a>
-    </body>
-    </html>
+    <h2>Login Admin</h2>
+    <form method="post" action="/login">
+      <input name="user" placeholder="Usuário"/><br><br>
+      <input name="pass" placeholder="Senha" type="password"/><br><br>
+      <button>Entrar</button>
+    </form>
     """
 
-@app.post("/create", response_class=HTMLResponse)
-async def create_key(request: Request):
-    form = await request.form()
-    days = int(form.get("days", 1))
+@app.post("/login")
+async def do_login(user: str = Form(...), passw: str = Form(...)):
+    if user == ADMIN_USER and passw == ADMIN_PASS:
+        token = str(uuid.uuid4())
+        sessions[token] = True
+        return RedirectResponse(url=f"/panel?token={token}", status_code=302)
+    return HTMLResponse("Login inválido", status_code=401)
+
+@app.get("/panel", response_class=HTMLResponse)
+async def panel(token: str):
+    if token not in sessions:
+        return HTMLResponse("Não autorizado", status_code=401)
 
     db = load_db()
-    key = str(uuid.uuid4()).split("-")[0].upper()
-    expires_at = now() + (days * 86400)
+    notice = load_notice()
 
-    db[key] = {
-        "hwid": None,
-        "expires_at": expires_at
-    }
-
-    save_db(db)
-
-    return f"""
-    <html><body style="background:#111;color:white;font-family:Arial;padding:40px">
-    <h2>Key criada com sucesso:</h2>
-    <h1>{key}</h1>
-    <a href="/">Voltar</a>
-    </body></html>
-    """
-
-@app.get("/list", response_class=HTMLResponse)
-async def list_keys():
-    db = load_db()
     rows = ""
     for k, v in db.items():
-        rows += f"<tr><td>{k}</td><td>{v['hwid']}</td><td>{time.ctime(v['expires_at'])}</td></tr>"
+        rows += f"""
+        <tr>
+            <td>{k}</td>
+            <td>{v.get('hwid')}</td>
+            <td>{time.ctime(v['expires_at'])}</td>
+            <td>{'BANIDA' if v.get('banned') else 'OK'}</td>
+            <td>
+              <a href="/reset?key={k}&token={token}">Reset HWID</a> |
+              <a href="/ban?key={k}&token={token}">Banir</a>
+            </td>
+        </tr>
+        """
 
     return f"""
-    <html><body style="background:#111;color:white;font-family:Arial;padding:40px">
-    <h2>Licenças</h2>
-    <table border="1" cellpadding="10">
-        <tr><th>KEY</th><th>HWID</th><th>EXPIRA EM</th></tr>
-        {rows}
+    <h1>Painel ADM</h1>
+
+    <h3>Aviso Global</h3>
+    <form method="post" action="/notice">
+      <input type="hidden" name="token" value="{token}"/>
+      <textarea name="text" rows="3" cols="40">{notice}</textarea><br>
+      <button>Salvar Aviso</button>
+    </form>
+
+    <h3>Gerar Key</h3>
+    <form method="post" action="/create">
+      <input type="hidden" name="token" value="{token}"/>
+      <input name="amount" placeholder="Quantidade" value="1"/>
+      <input name="hours" placeholder="Horas" value="0"/>
+      <input name="days" placeholder="Dias" value="1"/>
+      <input name="months" placeholder="Meses" value="0"/>
+      <button>Criar</button>
+    </form>
+
+    <h3>Licenças</h3>
+    <table border="1" cellpadding="5">
+      <tr><th>KEY</th><th>HWID</th><th>EXPIRA</th><th>Status</th><th>Ações</th></tr>
+      {rows}
     </table>
-    <br>
-    <a href="/">Voltar</a>
-    </body></html>
     """
+
+@app.post("/create")
+async def create(token: str = Form(...), amount: int = Form(1), hours: int = Form(0), days: int = Form(0), months: int = Form(0)):
+    if token not in sessions:
+        return HTMLResponse("Não autorizado", status_code=401)
+
+    db = load_db()
+    total_seconds = hours*3600 + days*86400 + months*2592000
+
+    for _ in range(amount):
+        key = str(uuid.uuid4()).split("-")[0].upper()
+        db[key] = {
+            "hwid": None,
+            "expires_at": now() + total_seconds,
+            "banned": False
+        }
+
+    save_db(db)
+    return RedirectResponse(url=f"/panel?token={token}", status_code=302)
+
+@app.get("/reset")
+async def reset_hwid(key: str, token: str):
+    if token not in sessions:
+        return HTMLResponse("Não autorizado", status_code=401)
+
+    db = load_db()
+    if key in db:
+        db[key]["hwid"] = None
+        save_db(db)
+
+    return RedirectResponse(url=f"/panel?token={token}", status_code=302)
+
+@app.get("/ban")
+async def ban_key(key: str, token: str):
+    if token not in sessions:
+        return HTMLResponse("Não autorizado", status_code=401)
+
+    db = load_db()
+    if key in db:
+        db[key]["banned"] = True
+        save_db(db)
+
+    return RedirectResponse(url=f"/panel?token={token}", status_code=302)
+
+@app.post("/notice")
+async def set_notice(token: str = Form(...), text: str = Form(...)):
+    if token not in sessions:
+        return HTMLResponse("Não autorizado", status_code=401)
+
+    save_notice(text)
+    return RedirectResponse(url=f"/panel?token={token}", status_code=302)
