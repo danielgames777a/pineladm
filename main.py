@@ -11,7 +11,7 @@ app = FastAPI()
 
 DB_FILE      = "licenses_db.json"
 LOG_FILE     = "login_logs.json"
-ADMIN_USER   = "Teste"
+ADMIN_USER   = "santos"
 ADMIN_PASS   = "1234"
 SESSIONS     = {}  # token -> True
 
